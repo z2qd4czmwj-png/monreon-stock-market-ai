@@ -1,164 +1,184 @@
 import os
+import time
 import requests
 import streamlit as st
+import pandas as pd
+import numpy as np
 import yfinance as yf
 
-# ========== CONFIG ==========
-st.set_page_config(page_title="Monreon Stock AI", page_icon="📈", layout="wide")
+# ===============================
+# 🔐 CONFIG & SECRETS
+# ===============================
+def get_secret(section: str, key: str, default: str = "") -> str:
+    if section in st.secrets and key in st.secrets[section]:
+        return st.secrets[section][key]
+    return os.getenv(key, default)
 
-# ======== SECRETS / ENV ========
-def get_secret(name: str, default: str = "") -> str:
-    # try streamlit secrets first
-    if name in st.secrets:
-        return st.secrets[name]
-    # fallback to env
-    return os.getenv(name, default)
+GUMROAD_PERMALINK = get_secret("gumroad", "GUMROAD_PRODUCT_PERMALINK", "")
+APP_TITLE = "📈 Monreon Stock AI — Market Intelligence Scanner"
 
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY", "")
-GUMROAD_PRODUCT_PERMALINK = get_secret("GUMROAD_PRODUCT_PERMALINK", "gtkwix")  # your product
-
-# ======== GUMROAD VERIFY ========
-def verify_gumroad_license(license_key: str) -> bool:
-    """
-    Calls Gumroad's license API to check if the key is valid.
-    Docs: https://gumroad.com/api#verify-license
-    """
+# ===============================
+# 🔒 LICENSE VALIDATION
+# ===============================
+def verify_gumroad_license(email: str, license_key: str) -> bool:
+    if not license_key or not email or not GUMROAD_PERMALINK:
+        return False
     url = "https://api.gumroad.com/v2/licenses/verify"
     payload = {
-        "product_permalink": GUMROAD_PRODUCT_PERMALINK,
+        "product_permalink": GUMROAD_PERMALINK,
         "license_key": license_key,
-        "increment_uses_count": True,
+        "increment_uses_count": True
     }
     try:
-        resp = requests.post(url, data=payload, timeout=10)
-        data = resp.json()
-        # Gumroad returns { success: true/false, ... }
-        return bool(data.get("success"))
-    except Exception as e:
-        st.error(f"Couldn't reach Gumroad: {e}")
+        r = requests.post(url, data=payload, timeout=10)
+        d = r.json()
+        return d.get("success") and d.get("purchase", {}).get("email", "").lower() == email.lower()
+    except Exception:
         return False
 
-# ======== OPENAI CALL ========
-def ai_comment_on_stock(ticker: str, info: dict) -> str:
+# ===============================
+# ⚙️ STOCK UNIVERSE
+# ===============================
+TOP_TECH = [
+    "AAPL", "MSFT", "NVDA", "META", "GOOGL", "AMZN", "TSLA", "AVGO",
+    "AMD", "ADBE", "CRM", "NFLX", "COST", "PEP", "INTC", "CSCO",
+    "TXN", "QCOM", "NOW", "ORCL", "SHOP", "UBER", "SNOW", "PANW",
+    "PLTR", "ABNB", "MRNA", "SPOT", "BA", "NKE"
+]
+
+# ===============================
+# 📊 METRICS & ANALYSIS
+# ===============================
+def download_data(tickers, period="10d"):
+    data = {}
+    for t in tickers:
+        try:
+            df = yf.download(t, period=period, interval="1d", progress=False)
+            if not df.empty:
+                data[t] = df
+        except Exception:
+            pass
+        time.sleep(0.1)
+    return data
+
+def analyze_data(data):
     """
-    Simple AI layer to explain the stock in plain English.
-    Uses your OpenAI key from secrets.
+    Compute momentum, volatility, and trend strength
     """
-    if not OPENAI_API_KEY:
-        return "⚠️ No OpenAI API key found in secrets. Add OPENAI_API_KEY."
+    rows = []
+    for t, df in data.items():
+        df = df.dropna()
+        if len(df) < 3:
+            continue
+        closes = df["Close"]
+        start, last = closes.iloc[0], closes.iloc[-1]
+        momentum = (last / start - 1) * 100
+        volatility = closes.pct_change().std() * 100
+        avg_volume = df["Volume"].mean()
+        trend_strength = momentum / (volatility + 1e-6)
+        rows.append({
+            "Ticker": t,
+            "Start Price": round(start, 2),
+            "Last Price": round(last, 2),
+            "Momentum %": round(momentum, 2),
+            "Volatility %": round(volatility, 2),
+            "Trend Strength": round(trend_strength, 2),
+            "Avg Volume": round(avg_volume / 1e6, 2)
+        })
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["Score"] = (
+        df["Momentum %"] * 0.6 +
+        (100 - df["Volatility %"]) * 0.2 +
+        df["Trend Strength"] * 0.2
+    )
+    return df.sort_values("Score", ascending=False).reset_index(drop=True)
 
-    # build a short context with price etc
-    current_price = info.get("current_price")
-    long_name = info.get("long_name") or ticker.upper()
+# ===============================
+# 🎨 STREAMLIT UI
+# ===============================
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.markdown(
+    f"<h1 style='text-align:center; color:#57a6ff;'>{APP_TITLE}</h1>",
+    unsafe_allow_html=True
+)
 
-    prompt = f"""
-You are an AI stock helper. The user is considering stock {long_name} ({ticker.upper()}).
-Current price: {current_price}
+with st.sidebar:
+    st.title("🔒 License Access")
+    email = st.text_input("Customer email (same as Gumroad)")
+    key = st.text_input("License key", type="password")
+    unlock = st.button("Unlock App")
 
-Give a short 3–5 bullet insight: possible trend, risk, and what to watch.
-Do NOT give financial advice, just analysis.
-"""
+    st.markdown("---")
+    st.caption("💡 You’ll receive your key automatically after purchase on Gumroad.")
+    st.markdown("[Go to Monreon Gumroad →](https://monreon.gumroad.com)")
 
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
+if "auth" not in st.session_state:
+    st.session_state.auth = False
 
-        res = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You analyze stocks in a neutral, educational way."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.4,
-            max_tokens=250,
-        )
-        return res.choices[0].message.content.strip()
-    except Exception as e:
-        return f"⚠️ AI request failed: {e}"
-
-# ======== STOCK FETCH ========
-def fetch_stock_data(ticker: str):
-    try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="5d")
-        info = stock.info
-        price = None
-        if "regularMarketPrice" in info:
-            price = info["regularMarketPrice"]
-        elif not hist.empty:
-            price = float(hist["Close"][-1])
-
-        return {
-            "ticker": ticker.upper(),
-            "long_name": info.get("longName"),
-            "current_price": price,
-            "history": hist,
-        }
-    except Exception as e:
-        st.error(f"Couldn't fetch {ticker}: {e}")
-        return None
-
-# ======== UI START ========
-st.title("📈 Monreon Stock Market AI")
-st.write("AI-powered stock insights. License-locked via Gumroad.")
-
-# keep license in session so user doesn’t re-enter
-if "license_ok" not in st.session_state:
-    st.session_state.license_ok = False
-
-if not st.session_state.license_ok:
-    st.subheader("🔑 Enter your license key")
-    lic = st.text_input("Paste the license key you got from Gumroad", type="password")
-
-    if st.button("Verify license"):
-        if lic.strip():
-            valid = verify_gumroad_license(lic.strip())
-            if valid:
-                st.session_state.license_ok = True
-                st.success("✅ License verified. Welcome!")
-                st.rerun()
-            else:
-                st.error("❌ License not valid for this product. Check your Gumroad receipt.")
+if unlock:
+    with st.spinner("Verifying license..."):
+        if verify_gumroad_license(email.strip(), key.strip()):
+            st.session_state.auth = True
+            st.sidebar.success("✅ License verified! Welcome to Monreon Elite.")
         else:
-            st.warning("Please paste a license key.")
-    st.stop()  # do not show the rest
+            st.session_state.auth = False
+            st.sidebar.error("❌ Invalid license. Check email/key.")
 
-# ======== MAIN APP (unlocked) ========
-st.success("✅ License active")
+if not st.session_state.auth:
+    st.warning("Please unlock with your Gumroad license to start scanning the market.")
+    st.stop()
 
-st.write("Enter 1 or more tickers (comma-separated): e.g. `AAPL, TSLA, NVDA`")
-tickers_input = st.text_input("Tickers", "AAPL")
+# ===============================
+# ✅ MAIN APP
+# ===============================
+st.success("✅ License verified — scanning market data in real time.")
 
-if st.button("Analyze"):
-    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
-    if not tickers:
-        st.warning("Add at least one ticker.")
+col1, col2, col3 = st.columns([2, 2, 1])
+with col1:
+    universe_mode = st.selectbox(
+        "Choose universe",
+        ["Top Tech 30", "Custom tickers"]
+    )
+with col2:
+    lookback = st.slider("Lookback days", 3, 20, 7)
+with col3:
+    st.write("")
+    start_btn = st.button("🚀 Run Scanner", use_container_width=True)
+
+if universe_mode == "Top Tech 30":
+    tickers = TOP_TECH
+else:
+    tickers = [x.strip().upper() for x in st.text_area(
+        "Paste your custom tickers (comma separated)", "AAPL, MSFT, TSLA").split(",") if x.strip()]
+
+if start_btn:
+    st.markdown("### ⏱️ Fetching & analyzing market data...")
+    with st.spinner("Downloading recent data and calculating performance metrics..."):
+        data = download_data(tickers, period=f"{lookback}d")
+        result = analyze_data(data)
+
+    if result.empty:
+        st.error("No valid data received. Try fewer or valid tickers.")
     else:
-        for t in tickers:
-            st.markdown(f"### {t}")
-            data = fetch_stock_data(t)
-            if not data:
-                st.warning(f"Skipped {t}")
-                continue
+        st.markdown("## 🔥 Top Momentum & Trend Stocks")
+        st.dataframe(result.head(15), use_container_width=True)
 
-            # show price
-            col1, col2 = st.columns([1, 2])
-            with col1:
-                st.metric("Current price", data.get("current_price", "N/A"))
-                if data.get("long_name"):
-                    st.caption(data["long_name"])
-            with col2:
-                if data.get("history") is not None and not data["history"].empty:
-                    st.line_chart(data["history"]["Close"])
-                else:
-                    st.write("No recent price history.")
+        # Highlight strongest
+        top = result.head(3)
+        insights = []
+        for i, r in top.iterrows():
+            insights.append(
+                f"**{r['Ticker']}** is up **{r['Momentum %']}%** with strong trend strength ({r['Trend Strength']:.2f}) and steady volume ({r['Avg Volume']}M avg)."
+            )
+        st.markdown("### 🧠 AI-Style Insights")
+        st.markdown("\n".join(insights))
+        st.info("Combine these signals with your own technical indicators and strategy. Data updates daily via Yahoo Finance.")
 
-            # AI insight
-            with st.spinner("Calling AI..."):
-                ai_text = ai_comment_on_stock(t, data)
-            st.markdown("**AI insight:**")
-            st.write(ai_text)
-            st.divider()
-
-# footer
-st.caption("Monreon AI • secured with Gumroad licensing")
+        # Chart visualization for top
+        pick = st.selectbox("Select a stock to visualize", result["Ticker"].head(10))
+        if pick in data:
+            st.line_chart(data[pick]["Close"], use_container_width=True)
+else:
+    st.info("Click **🚀 Run Scanner** to start scanning the market.")
