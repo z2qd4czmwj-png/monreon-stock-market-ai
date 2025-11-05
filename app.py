@@ -179,10 +179,10 @@ cols = st.columns(len(indices))
 for i, (name, symbol) in enumerate(indices.items()):
     df_idx = fetch_yf_data(symbol, period="5d", interval="1d")
     if not df_idx.empty:
-        latest = df_idx["Close"].iloc[-1]
-        prev = df_idx["Close"].iloc[-2] if len(df_idx) > 1 else latest
-        pct = (latest - prev) / prev * 100 if prev else 0
-        cols[i].metric(name, f"${latest:,.2f}", f"{pct:+.2f}%")
+        latest = float(df_idx["Close"].iloc[-1])
+prev = float(df_idx["Close"].iloc[-2]) if len(df_idx) > 1 else latest
+pct = ((latest - prev) / prev * 100) if prev != 0 else 0
+cols[i].metric(name, f"${latest:,.2f}", f"{pct:+.2f}%")
     else:
         cols[i].write(name)
 st.divider()
