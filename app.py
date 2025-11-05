@@ -1,7 +1,7 @@
 import os
-import time
-from datetime import datetime
-from typing import Dict, Any, List
+import json
+import datetime
+from typing import List, Dict, Any, Optional
 
 import streamlit as st
 import pandas as pd
@@ -9,34 +9,21 @@ import yfinance as yf
 import requests
 
 # =========================
-# SECRETS / CONFIG
+# CONFIG / SECRETS HELPERS
 # =========================
 
 def get_secret(section: str, key: str, default: str = "") -> str:
-    """Read from .streamlit/secrets.toml if available, else env."""
+    """Read from Streamlit secrets first, then env vars."""
     if section in st.secrets and key in st.secrets[section]:
         return st.secrets[section][key]
     return os.getenv(key, default)
 
-GUMROAD_PRODUCT_ID     = get_secret("gumroad", "PRODUCT_ID", "")
-GUMROAD_ACCESS_TOKEN   = get_secret("gumroad", "ACCESS_TOKEN", "")
-OPENAI_API_KEY         = get_secret("openai", "OPENAI_API_KEY", "")
-MAX_USES_PER_DAY       = int(get_secret("app", "MAX_USES_PER_DAY", "50"))
 
-# hard-coded “top most traded” style list
-TOP_10_TICKERS = [
-    "AAPL", "MSFT", "TSLA", "NVDA", "AMZN",
-    "META", "GOOGL", "AVGO", "AMD", "NFLX",
-]
-
-# mapping the dropdown label → (period, interval)
-# (all intervals are “safe”, we fall back to 1d anyway)
-TIMEFRAMES = {
-    "6 months (1d)": ("6mo", "1d"),
-    "1 month (1d)": ("1mo", "1d"),
-    "5 days (1d)": ("5d", "1d"),
-    "1 day (1h)": ("1d", "1h"),
-}
+# ---- read secrets ----
+GUMROAD_PRODUCT_ID = get_secret("gumroad", "PRODUCT_ID", "")   # <- the real product id from JSON
+GUMROAD_ACCESS_TOKEN = get_secret("gumroad", "ACCESS_TOKEN", "")  # optional
+OPENAI_API_KEY = get_secret("openai", "OPENAI_API_KEY", "")       # optional
+MAX_USES_PER_DAY = int(get_secret("app", "MAX_USES_PER_DAY", "50"))
 
 # =========================
 # GUMROAD LICENSE VERIFY
@@ -44,68 +31,109 @@ TIMEFRAMES = {
 
 def verify_gumroad_license(license_key: str) -> Dict[str, Any]:
     """
-    Verify license against Gumroad.
-    We send: license_key + product_id
-    If you added ACCESS_TOKEN, we send that too.
+    Call Gumroad license verify endpoint.
+    We always send the product_id (NOT permalink).
+    If ACCESS_TOKEN is present, we send it too.
     """
     url = "https://api.gumroad.com/v2/licenses/verify"
     payload = {
         "license_key": license_key.strip(),
         "product_id": GUMROAD_PRODUCT_ID,
     }
-    # access token is optional – some accounts need it, some don’t
     if GUMROAD_ACCESS_TOKEN:
         payload["access_token"] = GUMROAD_ACCESS_TOKEN
 
     try:
-        r = requests.post(url, data=payload, timeout=10)
-        data = r.json()
-        data["_request_payload"] = payload  # for debugging in UI
+        resp = requests.post(url, data=payload, timeout=10)
+        data = resp.json()
         return data
     except Exception as e:
         return {
             "success": False,
-            "message": f"Error contacting Gumroad: {e}",
-            "_request_payload": payload,
+            "message": f"Request to Gumroad failed: {e}",
         }
+
+
+def check_daily_quota() -> bool:
+    """True if user still has uses left today."""
+    today = datetime.date.today().isoformat()
+    if "usage" not in st.session_state:
+        st.session_state["usage"] = {}
+    usage = st.session_state["usage"]
+    used_today = usage.get(today, 0)
+    return used_today < MAX_USES_PER_DAY
+
+
+def record_usage():
+    today = datetime.date.today().isoformat()
+    if "usage" not in st.session_state:
+        st.session_state["usage"] = {}
+    st.session_state["usage"][today] = st.session_state["usage"].get(today, 0) + 1
+
 
 # =========================
 # DATA FETCHING
 # =========================
 
-def fetch_yf_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
+def fetch_price_data(
+    ticker: str,
+    period: str = "5d",
+    interval: str = "30m",
+) -> Optional[pd.DataFrame]:
     """
-    Try to fetch with given interval. If empty and interval is intraday,
-    fall back to daily so the app never shows blank.
+    Fetch OHLCV with yfinance.
+    Returns None if no data.
     """
     try:
         df = yf.download(ticker, period=period, interval=interval, progress=False)
-        if df.empty and interval in ("5m", "15m", "30m", "1h"):
-            # fallback
-            df = yf.download(ticker, period=period, interval="1d", progress=False)
+        if df is None or df.empty:
+            return None
+        df = df.reset_index()
         return df
     except Exception:
-        return pd.DataFrame()
+        return None
+
+
+# simple timeframe map from the selectbox label
+TIMEFRAME_MAP = {
+    "5 days (1d)": ("5d", "1d"),
+    "5 days (30m)": ("5d", "30m"),
+    "1 month (1d)": ("1mo", "1d"),
+    "3 months (1d)": ("3mo", "1d"),
+    "1 year (1d)": ("1y", "1d"),
+}
+
+# static “most traded” for now
+TOP_10_MOST_TRADED_US = [
+    "AAPL", "TSLA", "NVDA", "MSFT", "AMZN",
+    "META", "GOOGL", "AVGO", "AMD", "NFLX"
+]
 
 # =========================
-# OPTIONAL AI COMMENTARY
+# AI COMMENT (optional)
 # =========================
 
-def ai_commentary(ticker: str, df: pd.DataFrame, mode: str = "momentum") -> str:
+def ai_comment_on_ticker(ticker: str, momentum: float, latest_price: float) -> str:
     """
-    Super simple AI hook. If OPENAI_API_KEY not set, return a generic text.
+    Very lightweight stub. If OPENAI key exists, we give a nicer sentence.
+    We won't actually call OpenAI here to keep it simple.
     """
-    if OPENAI_API_KEY == "":
-        return f"{ticker}: AI commentary is disabled (no OPENAI_API_KEY in secrets)."
+    if not OPENAI_API_KEY:
+        # fallback text
+        if momentum > 0:
+            return f"{ticker} shows positive short-term price change. Watch for continuation."
+        elif momentum < 0:
+            return f"{ticker} is pulling back today. Could be rotation or profit-taking."
+        else:
+            return f"{ticker} is flat today."
+    else:
+        # pretend AI answer (you can plug real call here)
+        direction = "bullish" if momentum > 0 else "bearish" if momentum < 0 else "neutral"
+        return (
+            f"AI view ({direction}): {ticker} moved {momentum:.2f}% over the last candle. "
+            f"Current price around ${latest_price:.2f}. Consider volume and broader market before acting."
+        )
 
-    # lightweight summary based on last rows
-    last_close = df["Close"].iloc[-1] if not df.empty else "unknown"
-    # we won’t actually call OpenAI here to keep it simple/run-anywhere
-    return (
-        f"{ticker}: latest close ≈ {last_close}. "
-        f"Mode: {mode}. "
-        "You can now plug in a real OpenAI call here to generate richer insights."
-    )
 
 # =========================
 # STREAMLIT APP
@@ -113,148 +141,154 @@ def ai_commentary(ticker: str, df: pd.DataFrame, mode: str = "momentum") -> str:
 
 st.set_page_config(page_title="Monreon Stock AI", layout="wide")
 
-# init session vars
-if "licensed" not in st.session_state:
-    st.session_state.licensed = False
-if "uses_today" not in st.session_state:
-    st.session_state.uses_today = 0
-if "license_key" not in st.session_state:
-    st.session_state.license_key = ""
+st.title("📈 Monreon Stock AI — Market Scanner")
+st.caption("Gumroad-locked tool · licensed customers only")
 
-# HEADER / HERO
-st.title("📈 Monreon Stock AI")
-st.caption("Gumroad-locked tool")
-
-# ===== LOGIN BOX UNDER TITLE =====
-with st.container():
+# ---- License box at the TOP (not in sidebar) ----
+with st.container(border=True):
     st.subheader("🔐 Enter your Gumroad license")
-    if not GUMROAD_PRODUCT_ID:
-        st.error("Gumroad product ID is missing in secrets. Add it under [gumroad] PRODUCT_ID = \"...\"")
-    input_license = st.text_input(
-        "License key",
-        value=st.session_state.license_key,
-        type="password",
-        placeholder="paste the license from your Gumroad email",
-    )
-    login_col1, login_col2 = st.columns([1, 2])
-    with login_col1:
-        if st.button("Unlock"):
-            resp = verify_gumroad_license(input_license)
-            if resp.get("success"):
-                st.session_state.licensed = True
-                st.session_state.license_key = input_license
-                st.success("License verified. Welcome! ✅")
+    lic = st.text_input("License key", type="password")
+
+    if st.button("Unlock", type="primary"):
+        if not GUMROAD_PRODUCT_ID:
+            st.error("Gumroad product_id is missing in Streamlit secrets. Add it under [gumroad].")
+        elif not lic:
+            st.error("Please enter a license key.")
+        else:
+            data = verify_gumroad_license(lic)
+            if data.get("success"):
+                st.session_state["licensed"] = True
+                st.session_state["license_key"] = lic
+                st.success("✅ License verified. Welcome!")
             else:
-                st.session_state.licensed = False
-                st.error(resp.get("message", "License invalid."))
+                st.session_state["licensed"] = False
+                st.error(f"❌ {data.get('message','License could not be verified.')}")
 
-                # show debug info
-                with st.expander("See what we sent / got from Gumroad"):
-                    st.write("Request payload:", resp.get("_request_payload"))
-                    st.write("Response:", resp)
-    with login_col2:
-        st.write(f"Today: {st.session_state.uses_today} / {MAX_USES_PER_DAY}")
+# show today's usage
+today = datetime.date.today().isoformat()
+used = st.session_state.get("usage", {}).get(today, 0)
+st.caption(f"Today: {used} / {MAX_USES_PER_DAY}")
 
-# stop here if not licensed
-if not st.session_state.licensed:
+# ---- stop here if not licensed ----
+if not st.session_state.get("licensed", False):
+    st.info("Enter a valid Gumroad license above to use the tool.")
     st.stop()
 
-# stop if over limit
-if st.session_state.uses_today >= MAX_USES_PER_DAY:
-    st.error("Daily limit reached for this session. Try again tomorrow.")
+# ---- if licensed but exceeded daily cap ----
+if not check_daily_quota():
+    st.error("You have reached today's analysis limit. Please come back tomorrow.")
     st.stop()
 
-# ============== MARKET HEADER ==============
-col_m1, col_m2, col_m3 = st.columns(3)
-with col_m1:
-    st.metric("Market status", "Online", delta=datetime.utcnow().strftime("UTC %H:%M"))
-with col_m2:
-    st.metric("Data source", "Yahoo Finance")
-with col_m3:
-    st.metric("Licensed to", "Gumroad customer")
+# =========================
+# MARKET HEADER
+# =========================
+with st.container(border=True):
+    st.subheader("📰 Market quick-look")
+    st.write(
+        "This is a simple header. We can later pull real indexes (SPY, QQQ, DIA) "
+        "and show % change here."
+    )
 
-st.markdown("---")
+st.divider()
 
-# ============== INPUT AREA ==============
-st.subheader("🚀 Scan the market")
-
-input_mode = st.radio(
-    "Choose input mode.",
-    ["Manual tickers", "Top 10 Most Traded US Stocks"],
-    horizontal=True,
-)
+# =========================
+# MAIN ANALYSIS FORM
+# =========================
+col1, col2, col3 = st.columns(3)
+with col1:
+    input_mode = st.radio(
+        "Choose input mode:",
+        ["Manual tickers", "Top 10 Most Traded US Stocks"],
+        horizontal=False,
+    )
+with col2:
+    timeframe_label = st.selectbox(
+        "Timeframe",
+        list(TIMEFRAME_MAP.keys()),
+        index=1,  # default "5 days (30m)"
+    )
+with col3:
+    analysis_mode = st.selectbox(
+        "Analysis mode",
+        ["Find momentum", "Show latest", "Volume focus"],
+    )
 
 if input_mode == "Manual tickers":
-    tickers_str = st.text_input(
-        "Tickers (comma separated)",
-        value="AAPL, TSLA, NVDA",
-        help="Example: AAPL, MSFT, TSLA",
-    )
-    tickers = [t.strip().upper() for t in tickers_str.split(",") if t.strip()]
+    raw_tickers = st.text_input("Tickers (comma separated)", value="AAPL, TSLA, NVDA")
+    tickers = [t.strip().upper() for t in raw_tickers.split(",") if t.strip()]
 else:
-    st.info("Using Monreon's popular US stocks list.")
-    tickers = TOP_10_TICKERS
-    st.write(", ".join(tickers))
+    st.info("Using preset: Top 10 most traded US stocks (static list).")
+    tickers = TOP_10_MOST_TRADED_US
 
-timeframe_label = st.selectbox("Timeframe", list(TIMEFRAMES.keys()), index=2)
-period, interval = TIMEFRAMES[timeframe_label]
+do_analyze = st.button("🚀 Analyze now")
 
-analysis_mode = st.selectbox(
-    "Analysis mode",
-    ["Find momentum", "Just show charts", "Volume focus"],
-)
+# =========================
+# RUN ANALYSIS
+# =========================
+if do_analyze:
+    # record usage at the moment user clicks
+    record_usage()
 
-run_scan = st.button("🔎 Analyze now")
+    period, interval = TIMEFRAME_MAP[timeframe_label]
 
-# ============== RESULT AREA ==============
-if run_scan and tickers:
-    st.session_state.uses_today += 1
+    for ticker in tickers:
+        st.subheader(f"📊 {ticker}  ↪")
+        df = fetch_price_data(ticker, period=period, interval=interval)
 
-    for tk in tickers:
-        st.markdown(f"### 📊 {tk}")
-
-        df = fetch_yf_data(tk, period=period, interval=interval)
-        if df.empty:
+        if df is None or df.empty:
             st.warning("No market data for this ticker.")
             continue
 
-        # basic derived info
-        latest = df["Close"].iloc[-1]
-        prev = df["Close"].iloc[-2] if len(df) > 1 else latest
-        pct = ((latest - prev) / prev * 100) if prev else 0
+        # we expect a 'Close' column
+        if "Close" not in df.columns:
+            st.warning("Downloaded data does not contain 'Close' prices.")
+            continue
 
-        cols_head = st.columns(3)
-        with cols_head[0]:
-            st.metric("Last price", f"{latest:,.2f}")
-        with cols_head[1]:
-            st.metric("Change % (vs prev)", f"{pct:,.2f}%")
-        with cols_head[2]:
-            st.metric("Data points", len(df))
+        # ------------- price change / momentum -------------
+        latest = float(df["Close"].iloc[-1])
+        if len(df) > 1:
+            prev = float(df["Close"].iloc[-2])
+        else:
+            prev = latest
+        pct = ((latest - prev) / prev * 100) if prev != 0 else 0.0
 
-        # ---- PRICE LINE CHART ----
-        st.line_chart(df[["Close"]])
+        # ------------- show basic stats -------------
+        stats_cols = st.columns(3)
+        with stats_cols[0]:
+            st.metric("Last price", f"${latest:.2f}")
+        with stats_cols[1]:
+            st.metric("Last candle %", f"{pct:.2f}%")
+        with stats_cols[2]:
+            st.write(f"Rows: {len(df)}")
 
-        # ---- PRICE + VOLUME CHART (simple stacked) ----
-        # we do two charts to keep it simple in Streamlit
-        st.caption("Price history")
-        st.area_chart(df["Close"])
-        st.caption("Volume")
-        st.bar_chart(df["Volume"])
+        # ------------- chart -------------
+        # we'll build a small combined frame with price + volume
+        chart_df = df.set_index(df.columns[0])  # datetime index
+        # Only keep columns that exist
+        keep_cols = []
+        if "Close" in chart_df.columns:
+            keep_cols.append("Close")
+        if "Volume" in chart_df.columns:
+            keep_cols.append("Volume")
+        if keep_cols:
+            st.line_chart(chart_df[keep_cols])
+        else:
+            st.info("No chartable columns found.")
 
-        # ---- AI COMMENTARY ----
-        with st.expander("🤖 AI commentary"):
-            st.write(ai_commentary(tk, df, analysis_mode))
+        # ------------- AI comment -------------
+        comment = ai_comment_on_ticker(ticker, pct, latest)
+        st.write(f"🧠 {comment}")
 
-        # ---- CSV EXPORT ----
-        csv = df.to_csv().encode("utf-8")
+        # ------------- CSV export -------------
+        csv = df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            label=f"Download {tk} data as CSV",
+            label=f"Download {ticker} CSV",
             data=csv,
-            file_name=f"{tk.lower()}_data.csv",
+            file_name=f"{ticker.lower()}_data.csv",
             mime="text/csv",
         )
 
-        st.markdown("---")
+        st.divider()
 
-# footer
-st.caption("© 2025 Monreon AI — Licensed customers only. Key sharing is prohibited.")
+else:
+    st.info("Select tickers and press **Analyze now** to see data.")
