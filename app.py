@@ -1,184 +1,211 @@
+# app.py — Monreon AI (Gumroad-protected)
+from __future__ import annotations
 import os
 import time
-import requests
+from typing import Dict, Any, List
+
 import streamlit as st
-import pandas as pd
-import numpy as np
-import yfinance as yf
+import requests
 
-# ===============================
-# 🔐 CONFIG & SECRETS
-# ===============================
-def get_secret(section: str, key: str, default: str = "") -> str:
-    if section in st.secrets and key in st.secrets[section]:
-        return st.secrets[section][key]
-    return os.getenv(key, default)
-
-GUMROAD_PERMALINK = get_secret("gumroad", "GUMROAD_PRODUCT_PERMALINK", "")
-APP_TITLE = "📈 Monreon Stock AI — Market Intelligence Scanner"
-
-# ===============================
-# 🔒 LICENSE VALIDATION
-# ===============================
-def verify_gumroad_license(email: str, license_key: str) -> bool:
-    if not license_key or not email or not GUMROAD_PERMALINK:
-        return False
-    url = "https://api.gumroad.com/v2/licenses/verify"
-    payload = {
-        "product_permalink": GUMROAD_PERMALINK,
-        "license_key": license_key,
-        "increment_uses_count": True
-    }
-    try:
-        r = requests.post(url, data=payload, timeout=10)
-        d = r.json()
-        return d.get("success") and d.get("purchase", {}).get("email", "").lower() == email.lower()
-    except Exception:
-        return False
-
-# ===============================
-# ⚙️ STOCK UNIVERSE
-# ===============================
-TOP_TECH = [
-    "AAPL", "MSFT", "NVDA", "META", "GOOGL", "AMZN", "TSLA", "AVGO",
-    "AMD", "ADBE", "CRM", "NFLX", "COST", "PEP", "INTC", "CSCO",
-    "TXN", "QCOM", "NOW", "ORCL", "SHOP", "UBER", "SNOW", "PANW",
-    "PLTR", "ABNB", "MRNA", "SPOT", "BA", "NKE"
-]
-
-# ===============================
-# 📊 METRICS & ANALYSIS
-# ===============================
-def download_data(tickers, period="10d"):
-    data = {}
-    for t in tickers:
-        try:
-            df = yf.download(t, period=period, interval="1d", progress=False)
-            if not df.empty:
-                data[t] = df
-        except Exception:
-            pass
-        time.sleep(0.1)
-    return data
-
-def analyze_data(data):
-    """
-    Compute momentum, volatility, and trend strength
-    """
-    rows = []
-    for t, df in data.items():
-        df = df.dropna()
-        if len(df) < 3:
-            continue
-        closes = df["Close"]
-        start, last = closes.iloc[0], closes.iloc[-1]
-        momentum = (last / start - 1) * 100
-        volatility = closes.pct_change().std() * 100
-        avg_volume = df["Volume"].mean()
-        trend_strength = momentum / (volatility + 1e-6)
-        rows.append({
-            "Ticker": t,
-            "Start Price": round(start, 2),
-            "Last Price": round(last, 2),
-            "Momentum %": round(momentum, 2),
-            "Volatility %": round(volatility, 2),
-            "Trend Strength": round(trend_strength, 2),
-            "Avg Volume": round(avg_volume / 1e6, 2)
-        })
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    df["Score"] = (
-        df["Momentum %"] * 0.6 +
-        (100 - df["Volatility %"]) * 0.2 +
-        df["Trend Strength"] * 0.2
-    )
-    return df.sort_values("Score", ascending=False).reset_index(drop=True)
-
-# ===============================
-# 🎨 STREAMLIT UI
-# ===============================
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.markdown(
-    f"<h1 style='text-align:center; color:#57a6ff;'>{APP_TITLE}</h1>",
-    unsafe_allow_html=True
+# =============== PAGE CONFIG ===============
+st.set_page_config(
+    page_title="Monreon Stock AI",
+    page_icon="📈",
+    layout="wide",
 )
 
-with st.sidebar:
-    st.title("🔒 License Access")
-    email = st.text_input("Customer email (same as Gumroad)")
-    key = st.text_input("License key", type="password")
-    unlock = st.button("Unlock App")
+# =============== STYLING ===============
+st.markdown(
+    """
+    <style>
+    body, [data-testid="stAppViewContainer"] {
+        background: #000000 !important;
+    }
+    .main .block-container {
+        background: #ffffff;
+        border-radius: 14px;
+        padding: 1.5rem 1.5rem 3rem 1.5rem;
+        box-shadow: 0 6px 26px rgba(0,0,0,0.2);
+        margin-top: 1.4rem;
+    }
+    [data-testid="stSidebar"] {
+        background: #0A1733 !important;
+    }
+    [data-testid="stSidebar"] * {
+        color: #ffffff !important;
+    }
+    .stButton>button {
+        background: #0A1733 !important;
+        color: #ffffff !important;
+        border-radius: 999px !important;
+        border: 0 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-    st.markdown("---")
-    st.caption("💡 You’ll receive your key automatically after purchase on Gumroad.")
-    st.markdown("[Go to Monreon Gumroad →](https://monreon.gumroad.com)")
+# =============== SECRETS HELPERS ===============
+def get_secret(path: str, key: str, default: str = "") -> str:
+    """
+    Reads from st.secrets[path][key] if available, falls back to env, then default.
+    Example: get_secret("gumroad", "PRODUCT_PERMALINK")
+    """
+    try:
+        if path in st.secrets and key in st.secrets[path]:
+            return st.secrets[path][key]
+    except Exception:
+        pass
+    return os.getenv(key, default)
 
-if "auth" not in st.session_state:
-    st.session_state.auth = False
 
-if unlock:
-    with st.spinner("Verifying license..."):
-        if verify_gumroad_license(email.strip(), key.strip()):
-            st.session_state.auth = True
-            st.sidebar.success("✅ License verified! Welcome to Monreon Elite.")
-        else:
-            st.session_state.auth = False
-            st.sidebar.error("❌ Invalid license. Check email/key.")
+# =============== CONFIG FROM SECRETS ===============
+GUMROAD_PRODUCT_PERMALINK = get_secret("gumroad", "PRODUCT_PERMALINK", "")
+GUMROAD_ACCESS_TOKEN = get_secret("gumroad", "ACCESS_TOKEN", "")
 
-if not st.session_state.auth:
-    st.warning("Please unlock with your Gumroad license to start scanning the market.")
-    st.stop()
+# MAX_USES_PER_DAY can be flat at root (like older version)
+MAX_USES_RAW = st.secrets.get("MAX_USES_PER_DAY", "50")
+try:
+    MAX_USES_PER_DAY = int(MAX_USES_RAW)
+except Exception:
+    MAX_USES_PER_DAY = 50  # fallback
 
-# ===============================
-# ✅ MAIN APP
-# ===============================
-st.success("✅ License verified — scanning market data in real time.")
+# =============== LICENSE VERIFY ===============
+def verify_gumroad_license(license_key: str) -> Dict[str, Any]:
+    """
+    Calls Gumroad's /v2/licenses/verify endpoint.
+    Returns the full JSON so we can inspect refunded, chargeback, etc.
+    """
+    if not GUMROAD_PRODUCT_PERMALINK:
+        # during dev you can allow access
+        return {"success": True, "dev_mode": True}
 
-col1, col2, col3 = st.columns([2, 2, 1])
-with col1:
-    universe_mode = st.selectbox(
-        "Choose universe",
-        ["Top Tech 30", "Custom tickers"]
-    )
-with col2:
-    lookback = st.slider("Lookback days", 3, 20, 7)
-with col3:
-    st.write("")
-    start_btn = st.button("🚀 Run Scanner", use_container_width=True)
+    url = "https://api.gumroad.com/v2/licenses/verify"
+    payload = {
+        "product_permalink": GUMROAD_PRODUCT_PERMALINK,
+        "license_key": license_key,
+        "increment_uses_count": True,
+    }
+    # if we have access token, add it
+    if GUMROAD_ACCESS_TOKEN:
+        payload["access_token"] = GUMROAD_ACCESS_TOKEN
 
-if universe_mode == "Top Tech 30":
-    tickers = TOP_TECH
-else:
-    tickers = [x.strip().upper() for x in st.text_area(
-        "Paste your custom tickers (comma separated)", "AAPL, MSFT, TSLA").split(",") if x.strip()]
+    try:
+        r = requests.post(url, data=payload, timeout=10)
+        j = r.json()
+        return j
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
-if start_btn:
-    st.markdown("### ⏱️ Fetching & analyzing market data...")
-    with st.spinner("Downloading recent data and calculating performance metrics..."):
-        data = download_data(tickers, period=f"{lookback}d")
-        result = analyze_data(data)
 
-    if result.empty:
-        st.error("No valid data received. Try fewer or valid tickers.")
+def license_gate():
+    """
+    Sidebar auth gate. Blocks the rest of the app until valid Gumroad license is provided.
+    Also enforces per-day usage in session.
+    """
+    # init session
+    st.session_state.setdefault("is_authed", False)
+    st.session_state.setdefault("uses_today", 0)
+    st.session_state.setdefault("day_stamp", time.strftime("%Y-%m-%d"))
+
+    # reset daily counter if new day
+    today = time.strftime("%Y-%m-%d")
+    if st.session_state["day_stamp"] != today:
+        st.session_state["day_stamp"] = today
+        st.session_state["uses_today"] = 0
+
+    with st.sidebar:
+        st.header("🔐 Monreon AI Login")
+        st.caption("Enter your Gumroad license key to unlock.")
+        lic = st.text_input("License key from Gumroad", type="password")
+        btn = st.button("Unlock")
+
+        # show daily usage
+        if MAX_USES_PER_DAY > 0:
+            st.write(f"Today: {st.session_state['uses_today']} / {MAX_USES_PER_DAY}")
+
+    if st.session_state["is_authed"]:
+        return  # already in
+
+    if btn:
+        if not lic.strip():
+            st.error("Please enter your license key.")
+            st.stop()
+
+        result = verify_gumroad_license(lic.strip())
+        if not result.get("success"):
+            st.error("❌ License not valid for this product. Check you bought the right one.")
+            st.stop()
+
+        # extra safety: block refunded / chargeback
+        purchase = result.get("purchase", {})
+        if purchase.get("refunded") or purchase.get("chargebacked"):
+            st.error("❌ This license was refunded or chargebacked.")
+            st.stop()
+
+        # save auth
+        st.session_state["is_authed"] = True
+        st.session_state["license_key"] = lic.strip()
+        st.success("✅ License verified. Welcome!")
+        st.experimental_rerun()
+
+    # if no button pressed yet -> block app
+    if not st.session_state["is_authed"]:
+        st.title("Monreon Stock AI")
+        st.info("This tool is protected. Enter your Gumroad license key in the sidebar to continue.")
+        st.stop()
+
+
+def check_daily_quota():
+    """
+    Enforces daily limit stored in session.
+    """
+    if MAX_USES_PER_DAY <= 0:
+        return  # unlimited
+
+    used = st.session_state.get("uses_today", 0)
+    if used >= MAX_USES_PER_DAY:
+        st.error("You have reached today's usage limit. Please come back tomorrow.")
+        st.stop()
+
+
+def count_use():
+    st.session_state["uses_today"] = st.session_state.get("uses_today", 0) + 1
+
+
+# =============== RUN AUTH GATE FIRST ===============
+license_gate()
+
+# =============== MAIN APP (after auth) ===============
+st.title("📈 Monreon Stock AI — Market Scanner")
+st.caption("AI-powered stock research. Licensed version.")
+
+# check daily usage
+check_daily_quota()
+
+# simple input UI
+tickers_raw = st.text_input("Enter tickers (comma separated)", "AAPL, TSLA, NVDA")
+purpose = st.selectbox("What do you want?", ["Quick health check", "Find momentum", "AI summary"])
+
+# when user clicks generate/analyze
+if st.button("Analyze now"):
+    count_use()  # increase usage
+    tickers = [t.strip().upper() for t in tickers_raw.split(",") if t.strip()]
+    if not tickers:
+        st.warning("Please enter at least one ticker.")
     else:
-        st.markdown("## 🔥 Top Momentum & Trend Stocks")
-        st.dataframe(result.head(15), use_container_width=True)
+        st.subheader("Scan Result")
+        for t in tickers:
+            st.markdown(f"**{t}**")
+            st.write("- Recent price: (fetch with yfinance or your data source)")
+            st.write("- AI opinion: This is where you'd add OpenAI analysis.")
+            st.write("---")
 
-        # Highlight strongest
-        top = result.head(3)
-        insights = []
-        for i, r in top.iterrows():
-            insights.append(
-                f"**{r['Ticker']}** is up **{r['Momentum %']}%** with strong trend strength ({r['Trend Strength']:.2f}) and steady volume ({r['Avg Volume']}M avg)."
-            )
-        st.markdown("### 🧠 AI-Style Insights")
-        st.markdown("\n".join(insights))
-        st.info("Combine these signals with your own technical indicators and strategy. Data updates daily via Yahoo Finance.")
-
-        # Chart visualization for top
-        pick = st.selectbox("Select a stock to visualize", result["Ticker"].head(10))
-        if pick in data:
-            st.line_chart(data[pick]["Close"], use_container_width=True)
-else:
-    st.info("Click **🚀 Run Scanner** to start scanning the market.")
+st.markdown(
+    """
+    <p style="font-size:11px; margin-top:2rem; color:#666;">
+    © 2025 Monreon AI. Licensed for personal/client use only. Redistribution or sharing of license keys is prohibited.
+    </p>
+    """,
+    unsafe_allow_html=True,
+)
